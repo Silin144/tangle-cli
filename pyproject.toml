@@ -1,11 +1,12 @@
 [project]
 name = "tangle-cli"
-version = "0.1.0"
+version = "0.1.4"
 description = "CLI for Tangle, the open-source ML pipeline orchestration platform"
 readme = "README.md"
 authors = [
     { name = "Alexey Volkov", email = "alexey.volkov@ark-kun.com" },
     { name = "Tangle authors" },
+    { name = "Volv Grebennikov", email = "volv.grebennikov@shopify.com" },
 ]
 requires-python = ">=3.10"
 dependencies = [
@@ -14,11 +15,12 @@ dependencies = [
     "docstring-parser>=0.16",
     "httpx>=0.28.1",
     "jinja2>=3.1",
+    "jsonschema>=4.25.0",
     "platformdirs>=4.10.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",
     "requests>=2.32.0",
-    "tangle-api==0.1.0",
+    "tangle-api==0.1.1",
     "tomli>=2.0; python_version < '3.11'",
 ]
 

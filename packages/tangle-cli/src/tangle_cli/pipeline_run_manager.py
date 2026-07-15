@@ -28,6 +28,7 @@ from .logger import Logger, get_default_logger
 from .pipeline_dehydrator import DehydrateChoice, PipelineDehydrator
 from .pipeline_hydrator import HydrationError, PipelineHydrator
 from .pipeline_run_details import PipelineRunDetails
+from .pipelines import collect_pipeline_spec_errors
 from .pipeline_run_search import PipelineRunSearch
 from .utils import dump_yaml
 
@@ -37,7 +38,8 @@ _FAILURE_EARLY_EXIT_STATUSES = ("FAILED", "SYSTEM_ERROR")
 _EXECUTION_STATE_TIMINGS_METADATA_KEY = "execution_state_timings"
 _EXECUTION_STATE_TIMING_MONOTONIC_METADATA_KEY = "_execution_state_timing_monotonic"
 _SUBMISSION_ID_ANNOTATION_KEY = "tangle-cli/submission-id"
-_SUBMIT_RECOVERY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+_SUBMIT_RECOVERY_BACKOFF_SECONDS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
+_DEFAULT_SUBMIT_RECOVERY_ATTEMPTS = 2
 
 
 class PipelineRunError(RuntimeError):
@@ -376,6 +378,26 @@ class PipelineRunHooks:
     ) -> dict[str, Any] | None:
         """Hook for TD JOB_CONFIG time input / scheduled runtime behavior."""
         return run_args
+
+    def validate_pipeline_for_run(
+        self,
+        pipeline_spec: dict[str, Any],
+        *,
+        pipeline_path: str | Path | None,
+        effective_path: str | Path | None,
+        skip_validation: bool,
+    ) -> list[str]:
+        """Return submit-time validation errors for a prepared pipeline spec.
+
+        The OSS default enforces the same local authoring validator used by
+        ``tangle pipeline validate``. Downstreams can override or extend this
+        hook with stricter schema/input validators.
+        """
+
+        del pipeline_path, effective_path
+        if skip_validation:
+            return []
+        return collect_pipeline_spec_errors(pipeline_spec)
 
     def transform_run_name(
         self,
@@ -833,6 +855,11 @@ class PipelineRunManager(TangleCliHandler):
             for parameter in parameters.values()
         )
 
+    @staticmethod
+    def _raise_pipeline_validation_error(validation_errors: list[str]) -> None:
+        if validation_errors:
+            raise PipelineRunError("Pipeline validation failed:\n  - " + "\n  - ".join(validation_errors))
+
     def load_pipeline_for_submit(
         self,
         pipeline_path: str | Path,
@@ -908,13 +935,15 @@ class PipelineRunManager(TangleCliHandler):
         pipeline_path: str | Path | None = None,
         run_as: str | None = None,
         hydrate: bool = True,
+        skip_validation: bool = False,
     ) -> PipelineSubmitPayload:
         """Prepare the generic submit payload from a pipeline spec.
 
         The order here is the submit-body contract shared by OSS and TD:
         prepare the spec, prepare runtime arguments, expand run-name templates,
-        convert/sanitize the payload, then merge downstream/default annotations
-        before caller-supplied annotations override them.
+        validate the prepared authoring spec, convert/sanitize the payload, then
+        merge downstream/default annotations before caller-supplied annotations
+        override them.
         """
 
         prepared_spec = self.prepare_pipeline_spec_for_submit(
@@ -925,6 +954,14 @@ class PipelineRunManager(TangleCliHandler):
         )
         prepared_run_args = self.hooks.prepare_run_arguments(prepared_spec, run_args)
         prepared_spec = self.apply_run_name_template(prepared_spec, prepared_run_args)
+        if not skip_validation:
+            validation_errors = self.hooks.validate_pipeline_for_run(
+                prepared_spec,
+                pipeline_path=pipeline_path,
+                effective_path=None,
+                skip_validation=False,
+            )
+            self._raise_pipeline_validation_error(validation_errors)
         payload = self.convert_yaml_to_payload(copy.deepcopy(prepared_spec), prepared_run_args)
         payload = self.sanitize_submit_payload(payload)
         root_task = payload["root_task"]
@@ -960,6 +997,7 @@ class PipelineRunManager(TangleCliHandler):
         pipeline_path: str | Path | None = None,
         run_as: str | None = None,
         hydrate: bool = True,
+        skip_validation: bool = False,
     ) -> dict[str, Any]:
         """Build a submit body from an already-prepared pipeline spec."""
 
@@ -970,6 +1008,7 @@ class PipelineRunManager(TangleCliHandler):
             pipeline_path=pipeline_path,
             run_as=run_as,
             hydrate=hydrate,
+            skip_validation=skip_validation,
         ).to_body()
 
     def prepare_submit_payload(
@@ -981,6 +1020,7 @@ class PipelineRunManager(TangleCliHandler):
         hydrate: bool = True,
         run_as: str | None = None,
         resolution_overrides: dict[str, Any] | None = None,
+        skip_validation: bool = False,
     ) -> PipelineSubmitPayload:
         pipeline_spec = self.load_pipeline_for_submit(
             pipeline_path,
@@ -994,6 +1034,7 @@ class PipelineRunManager(TangleCliHandler):
             pipeline_path=pipeline_path,
             run_as=run_as,
             hydrate=hydrate,
+            skip_validation=skip_validation,
         )
 
     def build_submit_body(
@@ -1005,6 +1046,7 @@ class PipelineRunManager(TangleCliHandler):
         hydrate: bool = True,
         run_as: str | None = None,
         resolution_overrides: dict[str, Any] | None = None,
+        skip_validation: bool = False,
     ) -> dict[str, Any]:
         return self.prepare_submit_payload(
             pipeline_path,
@@ -1013,6 +1055,7 @@ class PipelineRunManager(TangleCliHandler):
             hydrate=hydrate,
             run_as=run_as,
             resolution_overrides=resolution_overrides,
+            skip_validation=skip_validation,
         ).to_body()
 
     @staticmethod
@@ -1116,6 +1159,7 @@ class PipelineRunManager(TangleCliHandler):
         run_as: str | None = None,
         hydrate: bool = True,
         attempt: int = 1,
+        skip_validation: bool = False,
     ) -> dict[str, Any]:
         payload = self.prepare_submit_payload_from_spec(
             pipeline_spec,
@@ -1124,6 +1168,7 @@ class PipelineRunManager(TangleCliHandler):
             pipeline_path=pipeline_path,
             run_as=run_as,
             hydrate=hydrate,
+            skip_validation=skip_validation,
         )
         return self.submit_prepared_payload(payload, pipeline_path=pipeline_path, attempt=attempt)
 
@@ -1137,6 +1182,7 @@ class PipelineRunManager(TangleCliHandler):
         run_as: str | None = None,
         resolution_overrides: dict[str, Any] | None = None,
         attempt: int = 1,
+        skip_validation: bool = False,
     ) -> dict[str, Any]:
         payload = self.prepare_submit_payload(
             pipeline_path,
@@ -1145,6 +1191,7 @@ class PipelineRunManager(TangleCliHandler):
             hydrate=hydrate,
             run_as=run_as,
             resolution_overrides=resolution_overrides,
+            skip_validation=skip_validation,
         )
         return self.submit_prepared_payload(payload, pipeline_path=pipeline_path, attempt=attempt)
 
@@ -1528,6 +1575,11 @@ class PipelineRunManager(TangleCliHandler):
         submission_id = annotations.get(_SUBMISSION_ID_ANNOTATION_KEY)
         return str(submission_id) if submission_id else None
 
+    @staticmethod
+    def _submit_recovery_backoff_seconds(submit_recovery_attempts: int) -> tuple[float, ...]:
+        attempt_count = max(0, min(int(submit_recovery_attempts), len(_SUBMIT_RECOVERY_BACKOFF_SECONDS)))
+        return _SUBMIT_RECOVERY_BACKOFF_SECONDS[:attempt_count]
+
     def _submitted_runs_for_submission_id(self, submission_id: str) -> list[dict[str, Any]]:
         query = {
             "and": [
@@ -1553,11 +1605,21 @@ class PipelineRunManager(TangleCliHandler):
         self,
         *,
         submission_id: str | None,
+        submit_recovery_attempts: int = _DEFAULT_SUBMIT_RECOVERY_ATTEMPTS,
     ) -> dict[str, Any] | None:
         if not submission_id:
             return None
-        total_lookup_attempts = len(_SUBMIT_RECOVERY_BACKOFF_SECONDS)
-        for lookup_attempt, delay_seconds in enumerate(_SUBMIT_RECOVERY_BACKOFF_SECONDS, start=1):
+        backoff_seconds = self._submit_recovery_backoff_seconds(submit_recovery_attempts)
+        total_lookup_attempts = len(backoff_seconds)
+        if total_lookup_attempts == 0:
+            self.logger.warn(
+                "Submit recovery lookup disabled "
+                f"({_SUBMISSION_ID_ANNOTATION_KEY}={submission_id}, "
+                f"submit_recovery_attempts={submit_recovery_attempts}); "
+                "resubmitting the same frozen body with preserved inputs."
+            )
+            return None
+        for lookup_attempt, delay_seconds in enumerate(backoff_seconds, start=1):
             self.logger.info(
                 "Waiting "
                 f"{delay_seconds:g}s before checking whether failed submit already created a pipeline run "
@@ -1652,6 +1714,7 @@ class PipelineRunManager(TangleCliHandler):
         timeout_clock: str = "monotonic",
         exit_on_first_failure: bool = False,
         metadata: dict[str, Any] | None = None,
+        submit_recovery_attempts: int = _DEFAULT_SUBMIT_RECOVERY_ATTEMPTS,
         metadata_factory: Callable[
             [int, PipelineRunContext | None, Exception | None], dict[str, Any]
         ] | None = None,
@@ -1728,6 +1791,7 @@ class PipelineRunManager(TangleCliHandler):
                         if reused_after_submit_failure:
                             recovered_response = self._recover_submitted_run_after_submit_error(
                                 submission_id=self._submission_id_from_body(body),
+                                submit_recovery_attempts=submit_recovery_attempts,
                             )
                         if recovered_response is not None:
                             response = self._adopt_submitted_run(
@@ -1759,6 +1823,7 @@ class PipelineRunManager(TangleCliHandler):
                                 )
                                 recovered_response = self._recover_submitted_run_after_submit_error(
                                     submission_id=submission_id_for_recovery,
+                                    submit_recovery_attempts=submit_recovery_attempts,
                                 )
                                 if recovered_response is None:
                                     self.hooks.on_submit_error(submit_exc, context=context)
@@ -1839,6 +1904,7 @@ class PipelineRunManager(TangleCliHandler):
         timeout_clock: str = "monotonic",
         exit_on_first_failure: bool = False,
         metadata: dict[str, Any] | None = None,
+        submit_recovery_attempts: int = _DEFAULT_SUBMIT_RECOVERY_ATTEMPTS,
     ) -> dict[str, Any]:
         """Submit/wait/retry an already prepared submit body.
 
@@ -1867,6 +1933,7 @@ class PipelineRunManager(TangleCliHandler):
             timeout_clock=timeout_clock,
             exit_on_first_failure=exit_on_first_failure,
             metadata=metadata,
+            submit_recovery_attempts=submit_recovery_attempts,
         )
 
     def run_pipeline_spec(
@@ -1887,6 +1954,8 @@ class PipelineRunManager(TangleCliHandler):
         timeout_clock: str = "monotonic",
         exit_on_first_failure: bool = False,
         metadata: dict[str, Any] | None = None,
+        submit_recovery_attempts: int = _DEFAULT_SUBMIT_RECOVERY_ATTEMPTS,
+        skip_validation: bool = False,
     ) -> dict[str, Any]:
         """Submit/wait/retry an already hydrated/validated in-memory spec."""
 
@@ -1902,6 +1971,7 @@ class PipelineRunManager(TangleCliHandler):
                 pipeline_path=pipeline_path,
                 run_as=run_as,
                 hydrate=hydrate,
+                skip_validation=skip_validation,
             ).to_body()
 
         return self._run_body_factory(
@@ -1916,6 +1986,7 @@ class PipelineRunManager(TangleCliHandler):
             timeout_clock=timeout_clock,
             exit_on_first_failure=exit_on_first_failure,
             metadata=metadata,
+            submit_recovery_attempts=submit_recovery_attempts,
         )
 
     def run_pipeline(
@@ -1936,6 +2007,8 @@ class PipelineRunManager(TangleCliHandler):
         timeout_clock: str = "monotonic",
         exit_on_first_failure: bool = False,
         metadata: dict[str, Any] | None = None,
+        submit_recovery_attempts: int = _DEFAULT_SUBMIT_RECOVERY_ATTEMPTS,
+        skip_validation: bool = False,
     ) -> dict[str, Any]:
         """Submit (and optionally wait for) a pipeline with lifecycle hooks.
 
@@ -1956,6 +2029,7 @@ class PipelineRunManager(TangleCliHandler):
                 hydrate=hydrate,
                 run_as=run_as,
                 resolution_overrides=resolution_overrides,
+                skip_validation=skip_validation,
             ).to_body()
 
         return self._run_body_factory(
@@ -1970,6 +2044,7 @@ class PipelineRunManager(TangleCliHandler):
             timeout_clock=timeout_clock,
             exit_on_first_failure=exit_on_first_failure,
             metadata=metadata,
+            submit_recovery_attempts=submit_recovery_attempts,
         )
 
 

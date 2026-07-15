@@ -49,6 +49,34 @@ def _write_pipeline(path: Path) -> Path:
     return path
 
 
+def _write_invalid_authoring_pipeline(path: Path) -> Path:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Invalid Pipeline",
+                "implementation": {"graph": {"tasks": {"missing-ref": {}}}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_bare_container_pipeline(path: Path) -> Path:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Bare Container",
+                "implementation": {"container": {"image": "busybox"}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.base_url = "https://tangle.example"
@@ -58,6 +86,7 @@ class FakeClient:
         self.annotation_deletes: list[tuple[str, str]] = []
         self.get_calls: list[dict[str, Any]] = []
         self.list_calls: list[dict[str, Any]] = []
+        self.component_gets: list[str] = []
 
     def pipeline_runs_create(self, body: Any = None) -> dict[str, Any]:
         self.created.append(body)
@@ -106,7 +135,11 @@ class FakeClient:
             raw={"componentRef": {"spec": {"name": "Exported", "implementation": {"graph": {"tasks": {}}}}}}
         )
 
+    def resolve_digest(self, digest: str) -> str:
+        return digest
+
     def get_component_spec(self, digest: str) -> dict[str, Any]:
+        self.component_gets.append(digest)
         return {"name": digest}
 
 
@@ -135,7 +168,9 @@ def test_pipeline_runs_help_exposes_run_commands_not_local_pipeline_commands(cap
     assert "diagram" not in output
 
     run_app(app, ["sdk", "pipeline-runs", "submit", "--help"])
-    assert "--log-type" in capsys.readouterr().out
+    submit_help = capsys.readouterr().out
+    assert "--log-type" in submit_help
+    assert "--submit-recovery-attempts" in submit_help
 
 
 def test_pipeline_runs_submit_builds_create_payload(monkeypatch, tmp_path: Path, capsys):
@@ -161,10 +196,236 @@ def test_pipeline_runs_submit_builds_create_payload(monkeypatch, tmp_path: Path,
 
     result = json.loads(capsys.readouterr().out)
     assert result == {"id": "run-1", "root_execution_id": "exec-1"}
-    assert fake_client.created[0]["annotations"] == {"team": "oss"}
+    assert fake_client.created[0]["annotations"]["team"] == "oss"
+    assert fake_client.created[0]["annotations"]["tangle-cli/submission-id"]
     root_task = fake_client.created[0]["root_task"]
     assert root_task["componentRef"]["spec"]["name"] == "Demo Pipeline"
     assert root_task["arguments"] == {"query": "default", "required": "value"}
+
+
+def test_pipeline_runs_submit_rejects_authoring_validation_errors(monkeypatch, tmp_path: Path):
+    pipeline_path = _write_invalid_authoring_pipeline(tmp_path / "pipeline.yaml")
+    fake_client = FakeClient()
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: fake_client)
+    app = cli.build_app()
+
+    with pytest.raises(SystemExit) as excinfo:
+        app(["sdk", "pipeline-runs", "submit", str(pipeline_path), "--no-hydrate"])
+
+    message = str(excinfo.value)
+    assert "Pipeline validation failed" in message
+    assert "pipeline.implementation.graph.tasks.missing-ref.componentRef" in message
+    assert fake_client.created == []
+
+
+def test_pipeline_runs_submit_dry_run_rejects_authoring_validation_errors(monkeypatch, tmp_path: Path):
+    pipeline_path = _write_invalid_authoring_pipeline(tmp_path / "pipeline.yaml")
+    fake_client = FakeClient()
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: fake_client)
+    app = cli.build_app()
+
+    with pytest.raises(SystemExit) as excinfo:
+        app(["sdk", "pipeline-runs", "submit", str(pipeline_path), "--no-hydrate", "--dry-run"])
+
+    message = str(excinfo.value)
+    assert "Pipeline validation failed" in message
+    assert "pipeline.implementation.graph.tasks.missing-ref.componentRef" in message
+    assert fake_client.created == []
+
+
+def test_pipeline_runs_submit_validates_after_hydration(monkeypatch, tmp_path: Path):
+    pipeline_path = tmp_path / "pipeline.yaml"
+    pipeline_path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Invalid Pipeline",
+                "implementation": {
+                    "graph": {
+                        "tasks": {
+                            "task": {
+                                "componentRef": {"digest": "sha256:component"},
+                                "dependencies": ["missing"],
+                            }
+                        }
+                    }
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    fake_client = FakeClient()
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: fake_client)
+    app = cli.build_app()
+
+    with pytest.raises(SystemExit) as excinfo:
+        app(["sdk", "pipeline-runs", "submit", str(pipeline_path)])
+
+    assert "unknown task 'missing'" in str(excinfo.value)
+    assert fake_client.component_gets == ["sha256:component"]
+    assert fake_client.created == []
+
+
+def test_pipeline_runs_submit_rejects_bare_container_root(monkeypatch, tmp_path: Path):
+    pipeline_path = _write_bare_container_pipeline(tmp_path / "pipeline.yaml")
+    fake_client = FakeClient()
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: fake_client)
+    app = cli.build_app()
+
+    with pytest.raises(SystemExit) as excinfo:
+        app(["sdk", "pipeline-runs", "submit", str(pipeline_path), "--no-hydrate"])
+
+    message = str(excinfo.value)
+    assert "Pipeline validation failed" in message
+    assert "implementation.graph must be an object" in message
+    assert fake_client.created == []
+
+
+def test_pipeline_runs_submit_dry_run_rejects_bare_container_root(monkeypatch, tmp_path: Path):
+    pipeline_path = _write_bare_container_pipeline(tmp_path / "pipeline.yaml")
+    fake_client = FakeClient()
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: fake_client)
+    app = cli.build_app()
+
+    with pytest.raises(SystemExit) as excinfo:
+        app(["sdk", "pipeline-runs", "submit", str(pipeline_path), "--no-hydrate", "--dry-run"])
+
+    message = str(excinfo.value)
+    assert "Pipeline validation failed" in message
+    assert "implementation.graph must be an object" in message
+    assert fake_client.created == []
+
+
+def test_pipeline_runs_submit_allows_template_that_hydrates_to_valid_graph(
+    monkeypatch, tmp_path: Path, capsys
+):
+    (tmp_path / "pipeline.yaml.j2").write_text(
+        "name: {{ pipeline_name }}\nimplementation:\n  graph:\n    tasks: {}\n",
+        encoding="utf-8",
+    )
+    pipeline_path = tmp_path / "pipeline.config.yaml"
+    pipeline_path.write_text(
+        yaml.safe_dump(
+            {"template_file": "pipeline.yaml.j2", "pipeline_name": "Rendered Pipeline"},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    fake_client = FakeClient()
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: fake_client)
+    app = cli.build_app()
+
+    run_app(app, ["sdk", "pipeline-runs", "submit", str(pipeline_path)])
+
+    assert json.loads(capsys.readouterr().out) == {"id": "run-1", "root_execution_id": "exec-1"}
+    submitted_spec = fake_client.created[0]["root_task"]["componentRef"]["spec"]
+    assert submitted_spec["name"] == "Rendered Pipeline"
+    assert submitted_spec["implementation"] == {"graph": {"tasks": {}}}
+
+
+def test_pipeline_runs_submit_rejects_template_that_hydrates_to_bare_container(
+    monkeypatch, tmp_path: Path
+):
+    (tmp_path / "pipeline.yaml.j2").write_text(
+        "name: {{ pipeline_name }}\nimplementation:\n  container:\n    image: busybox\n",
+        encoding="utf-8",
+    )
+    pipeline_path = tmp_path / "pipeline.config.yaml"
+    pipeline_path.write_text(
+        yaml.safe_dump(
+            {"template_file": "pipeline.yaml.j2", "pipeline_name": "Rendered Container"},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    fake_client = FakeClient()
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: fake_client)
+    app = cli.build_app()
+
+    with pytest.raises(SystemExit) as excinfo:
+        app(["sdk", "pipeline-runs", "submit", str(pipeline_path)])
+
+    message = str(excinfo.value)
+    assert "Pipeline validation failed" in message
+    assert "implementation.graph must be an object" in message
+    assert fake_client.created == []
+
+
+def test_pipeline_runs_submit_dry_run_rejects_template_that_hydrates_to_bare_container(
+    monkeypatch, tmp_path: Path
+):
+    (tmp_path / "pipeline.yaml.j2").write_text(
+        "name: {{ pipeline_name }}\nimplementation:\n  container:\n    image: busybox\n",
+        encoding="utf-8",
+    )
+    pipeline_path = tmp_path / "pipeline.config.yaml"
+    pipeline_path.write_text(
+        yaml.safe_dump(
+            {"template_file": "pipeline.yaml.j2", "pipeline_name": "Rendered Container"},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    fake_client = FakeClient()
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: fake_client)
+    app = cli.build_app()
+
+    with pytest.raises(SystemExit) as excinfo:
+        app(["sdk", "pipeline-runs", "submit", str(pipeline_path), "--dry-run"])
+
+    message = str(excinfo.value)
+    assert "Pipeline validation failed" in message
+    assert "implementation.graph must be an object" in message
+    assert fake_client.created == []
+
+
+def test_pipeline_runs_submit_uses_default_submit_recovery_attempts(monkeypatch, tmp_path: Path, capsys):
+    pipeline_path = _write_pipeline(tmp_path / "pipeline.yaml")
+    captured: dict[str, Any] = {}
+
+    def fake_run_pipeline(self, pipeline_path, **kwargs):
+        del self, pipeline_path
+        captured.update(kwargs)
+        return {"response": {"id": "run-1"}}
+
+    monkeypatch.setattr(PipelineRunManager, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: FakeClient())
+    app = cli.build_app()
+
+    run_app(app, ["sdk", "pipeline-runs", "submit", str(pipeline_path), "--no-hydrate"])
+
+    assert json.loads(capsys.readouterr().out) == {"id": "run-1"}
+    assert captured["submit_recovery_attempts"] == pipeline_run_manager._DEFAULT_SUBMIT_RECOVERY_ATTEMPTS
+
+
+def test_pipeline_runs_submit_accepts_submit_recovery_attempts(monkeypatch, tmp_path: Path, capsys):
+    pipeline_path = _write_pipeline(tmp_path / "pipeline.yaml")
+    captured: dict[str, Any] = {}
+
+    def fake_run_pipeline(self, pipeline_path, **kwargs):
+        del self, pipeline_path
+        captured.update(kwargs)
+        return {"response": {"id": "run-1"}}
+
+    monkeypatch.setattr(PipelineRunManager, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(pipeline_runs_cli, "LazyTangleApiClient", lambda **kwargs: FakeClient())
+    app = cli.build_app()
+
+    run_app(
+        app,
+        [
+            "sdk",
+            "pipeline-runs",
+            "submit",
+            str(pipeline_path),
+            "--no-hydrate",
+            "--submit-recovery-attempts",
+            "6",
+        ],
+    )
+
+    assert json.loads(capsys.readouterr().out) == {"id": "run-1"}
+    assert captured["submit_recovery_attempts"] == 6
 
 
 def test_pipeline_runs_submit_accepts_export_config_args_and_hydrate(monkeypatch, tmp_path: Path):
@@ -1752,7 +2013,7 @@ def test_pipeline_runs_submit_failure_recovery_waits_for_delayed_registration(mo
 
         def pipeline_runs_list(self, **kwargs: Any) -> dict[str, Any]:
             self.list_calls.append(kwargs)
-            if len(self.list_calls) <= 2:
+            if len(self.list_calls) < len(pipeline_run_manager._SUBMIT_RECOVERY_BACKOFF_SECONDS):
                 return {"pipeline_runs": [], "next_page_token": None}
             return {
                 "pipeline_runs": [{"id": "run-created", "root_execution_id": "exec-created"}],
@@ -1763,13 +2024,13 @@ def test_pipeline_runs_submit_failure_recovery_waits_for_delayed_registration(mo
     manager = PipelineRunManager(client=client)
     body = {"root_task": {"componentRef": {"spec": {"name": "delayed-recovery"}}}}
 
-    result = manager.run_prepared_body(body)
+    result = manager.run_prepared_body(body, submit_recovery_attempts=6)
 
     assert result["response"]["id"] == "run-created"
     assert result["context"].metadata["recovered_after_submit_error"] is True
     assert len(client.created) == 1
-    assert len(client.list_calls) == 3
-    assert sleeps == [0.5, 1.0, 2.0]
+    assert len(client.list_calls) == len(pipeline_run_manager._SUBMIT_RECOVERY_BACKOFF_SECONDS)
+    assert sleeps == list(pipeline_run_manager._SUBMIT_RECOVERY_BACKOFF_SECONDS)
 
 
 def test_pipeline_runs_submit_failure_recovery_refuses_ambiguous_matches(monkeypatch) -> None:
@@ -1869,8 +2130,8 @@ def test_pipeline_runs_submit_failure_reuses_frozen_body_when_recovery_finds_no_
     assert client.created[0]["annotations"]["tangle-cli/submission-id"] == client.created[1]["annotations"][
         "tangle-cli/submission-id"
     ]
-    assert len(client.list_calls) == 2 * len(pipeline_run_manager._SUBMIT_RECOVERY_BACKOFF_SECONDS)
-    expected_sleeps = list(pipeline_run_manager._SUBMIT_RECOVERY_BACKOFF_SECONDS)
+    expected_sleeps = list(pipeline_run_manager._SUBMIT_RECOVERY_BACKOFF_SECONDS[:2])
+    assert len(client.list_calls) == 2 * len(expected_sleeps)
     assert sleeps == expected_sleeps + expected_sleeps
 
 
@@ -1927,7 +2188,7 @@ def test_pipeline_runs_recovered_retry_runs_after_retry_submit_hook(tmp_path: Pa
     client = RecoverOnRetryClient()
     manager = PipelineRunner(client=client, hooks=hooks)
 
-    result = manager.run_pipeline(pipeline_path, hydrate=False, max_attempts=2)
+    result = manager.run_pipeline(pipeline_path, hydrate=False, max_attempts=2, submit_recovery_attempts=6)
 
     assert result["response"]["id"] == "run-created"
     assert result["context"].attempt == 2
@@ -1935,7 +2196,7 @@ def test_pipeline_runs_recovered_retry_runs_after_retry_submit_hook(tmp_path: Pa
     assert hooks.prepare_run_arguments_calls == 1
     assert len(client.created) == 1
     assert len(client.list_calls) == len(pipeline_run_manager._SUBMIT_RECOVERY_BACKOFF_SECONDS) + 1
-    assert sleeps == [0.5, 1.0, 2.0, 0.5]
+    assert sleeps == [*pipeline_run_manager._SUBMIT_RECOVERY_BACKOFF_SECONDS, 0.5]
     assert events == [("before_retry", 2, None), ("after_retry_submit", 2, "run-created")]
 
 
@@ -2274,6 +2535,40 @@ def test_pipeline_runner_orchestrates_load_validate_submit_wait(tmp_path: Path) 
     assert client.created[0]["root_task"]["componentRef"]["spec"]["name"] == "Run value"
 
 
+def test_pipeline_run_manager_submit_and_dry_run_validate_once_at_choke_point(tmp_path: Path) -> None:
+    pipeline_path = _write_pipeline(tmp_path / "pipeline.yaml")
+    calls: list[str] = []
+
+    class Hooks(PipelineRunHooks):
+        def validate_pipeline_for_run(self, pipeline_spec, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(f"validate:{pipeline_spec['name']}:{kwargs['skip_validation']}")
+            return super().validate_pipeline_for_run(pipeline_spec, **kwargs)
+
+    manager = PipelineRunManager(client=FakeClient(), hooks=Hooks())
+
+    manager.run_pipeline(pipeline_path, run_args={"required": "value"}, hydrate=False)
+    assert calls == ["validate:Demo Pipeline:False"]
+
+    calls.clear()
+    manager.build_submit_body(pipeline_path, run_args={"required": "value"}, hydrate=False)
+    assert calls == ["validate:Demo Pipeline:False"]
+
+
+def test_pipeline_runner_inherited_dry_run_validates_once_at_choke_point(tmp_path: Path) -> None:
+    pipeline_path = _write_pipeline(tmp_path / "pipeline.yaml")
+    calls: list[str] = []
+
+    class Hooks(PipelineRunnerHooks):
+        def validate_pipeline_for_run(self, pipeline_spec, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(f"validate:{pipeline_spec['name']}:{kwargs['skip_validation']}")
+            return super().validate_pipeline_for_run(pipeline_spec, **kwargs)
+
+    runner = PipelineRunner(client=FakeClient(), hooks=Hooks())
+
+    runner.build_submit_body(pipeline_path, run_args={"required": "value"}, hydrate=False)
+    assert calls == ["validate:Demo Pipeline:False"]
+
+
 def test_pipeline_runner_maps_non_mapping_yaml_to_run_error(tmp_path: Path) -> None:
     pipeline_path = tmp_path / "bad.yaml"
     pipeline_path.write_text("[]\n", encoding="utf-8")
@@ -2281,6 +2576,31 @@ def test_pipeline_runner_maps_non_mapping_yaml_to_run_error(tmp_path: Path) -> N
 
     with pytest.raises(PipelineRunError, match="top-level mapping"):
         runner.run_pipeline(pipeline_path, hydrate=False)
+
+
+def test_pipeline_runner_default_hook_rejects_authoring_validation_errors(tmp_path: Path) -> None:
+    pipeline_path = _write_invalid_authoring_pipeline(tmp_path / "pipeline.yaml")
+    client = FakeClient()
+    runner = PipelineRunner(client=client)
+
+    with pytest.raises(PipelineRunError, match="Pipeline validation failed") as excinfo:
+        runner.run_pipeline(pipeline_path, hydrate=False)
+
+    assert "pipeline.implementation.graph.tasks.missing-ref.componentRef" in str(excinfo.value)
+    assert client.created == []
+
+
+def test_pipeline_runner_skip_validation_bypasses_default_authoring_validator(tmp_path: Path) -> None:
+    pipeline_path = _write_invalid_authoring_pipeline(tmp_path / "pipeline.yaml")
+    client = FakeClient()
+    runner = PipelineRunner(client=client)
+
+    result = runner.run_pipeline(pipeline_path, hydrate=False, skip_validation=True)
+
+    assert result["run_id"] == "run-1"
+    assert len(client.created) == 1
+    submitted_tasks = client.created[0]["root_task"]["componentRef"]["spec"]["implementation"]["graph"]["tasks"]
+    assert submitted_tasks == {"missing-ref": {}}
 
 
 def test_pipeline_runner_layout_is_hookable(tmp_path: Path) -> None:
